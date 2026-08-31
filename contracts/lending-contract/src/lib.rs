@@ -1458,7 +1458,7 @@ impl LendingContract {
     ) -> Result<u64, LendingError> {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
-        Self::enter_reentrancy_guard(&env)?;
+        let _guard = access_control::ReentrancyGuard::lock(&env, LendingError::ReentrantCall)?;
         depositor.require_auth();
 
         if shares == 0 {
@@ -1518,7 +1518,6 @@ impl LendingContract {
             asset,
             shares
         );
-        Self::exit_reentrancy_guard(&env);
         Ok(amount)
     }
 
@@ -2798,7 +2797,7 @@ impl LendingContract {
         amount: u64,
     ) -> Result<u64, LendingError> {
         Self::require_initialized(&env)?;
-        Self::enter_reentrancy_guard(&env)?;
+        let _guard = access_control::ReentrancyGuard::lock(&env, LendingError::ReentrantCall)?;
         liquidator.require_auth();
 
         let loan: LoanRecord = env
