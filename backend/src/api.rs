@@ -65,6 +65,12 @@ pub struct Plan {
 pub struct AppState {
     pub anchor: Arc<AnchorRegistry>,
     pub db_pool: sqlx::PgPool,
+    /// Pool for read-only queries that tolerate replica lag.
+    ///
+    /// Equal to `db_pool` when no replica is configured, so a handler can use
+    /// it unconditionally. Only safe for queries whose caller is not reading
+    /// back its own write — see `get_plan_statistics`.
+    pub read_db_pool: sqlx::PgPool,
     pub kyc_webhook_secret: Option<String>,
     pub apy_config: yield_calculator::ApyConfig,
     pub plan_cache: PlanCache,
@@ -1305,6 +1311,12 @@ fn append_plan_statistics_filters(
 }
 
 /// Handler: GET /api/analytics/plan-statistics
+///
+/// Reads go to `read_db_pool`. This is an aggregate dashboard view whose
+/// caller is not reading back a write it just made, so replica lag shows up as
+/// a count being a few seconds stale rather than as a user failing to see
+/// their own change. Handlers that *do* read back their own writes must keep
+/// using `db_pool`.
 /// Aggregate plan metrics for the admin dashboard: plan counts by lifecycle
 /// stage and total locked value per asset. Protected by `jwt_auth_middleware`
 /// (admin JWT only) and cached in Redis (or the in-memory fallback) for
@@ -1356,7 +1368,7 @@ async fn get_plan_statistics(
 
     let summary = match summary_builder
         .build_query_as::<PlanStatisticsSummaryRow>()
-        .fetch_one(&state.db_pool)
+        .fetch_one(&state.read_db_pool)
         .await
     {
         Ok(row) => row,
@@ -1376,7 +1388,7 @@ async fn get_plan_statistics(
 
     let by_status = match status_builder
         .build_query_as::<PlanStatusCount>()
-        .fetch_all(&state.db_pool)
+        .fetch_all(&state.read_db_pool)
         .await
     {
         Ok(rows) => rows,
@@ -1399,7 +1411,7 @@ async fn get_plan_statistics(
 
     let locked_value_by_asset = match locked_builder
         .build_query_as::<AssetLockedValue>()
-        .fetch_all(&state.db_pool)
+        .fetch_all(&state.read_db_pool)
         .await
     {
         Ok(rows) => rows,
