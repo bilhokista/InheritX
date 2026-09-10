@@ -1,5 +1,10 @@
 "use client";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { SkeletonChart } from "@/components/ui/Skeleton";
+
+// Single source of truth for the plot height. The loading placeholder reads the
+// same constant, so the two cannot drift apart and reintroduce layout shift.
+const CHART_HEIGHT = 240;
 
 // Mock TVL time-series until backend exposes a history endpoint
 const tvlData = [
@@ -27,14 +32,22 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   );
 };
 
-export function TVLChart() {
+interface TVLChartProps {
+  /** Render the placeholder instead of the chart while data is in flight. */
+  isLoading?: boolean;
+}
+
+export function TVLChart({ isLoading = false }: TVLChartProps) {
   return (
     <div className="rounded-xl border border-white/5 bg-white/[0.02] sm:p-6 p-4 h-full">
       <div className="mb-5">
         <h2 className="text-sm font-semibold text-foreground">Total Value Locked (TVL)</h2>
         <p className="text-xs text-foreground/40 mt-0.5">12-month overview</p>
       </div>
-      <ResponsiveContainer width="100%" height={240}>
+      {isLoading ? (
+        <SkeletonChart height={CHART_HEIGHT} />
+      ) : (
+      <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
         <AreaChart data={tvlData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
           <defs>
             <linearGradient id="tvlGradient" x1="0" y1="0" x2="0" y2="1">
@@ -57,6 +70,7 @@ export function TVLChart() {
           />
         </AreaChart>
       </ResponsiveContainer>
+      )}
     </div>
   );
 }
