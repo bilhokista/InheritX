@@ -54,6 +54,59 @@ impl SignatureError {
             _ => "Invalid webhook signature",
         }
     }
+
+    /// Stable identifier written to `kyc_webhook_logs.auth_failure_reason`.
+    ///
+    /// Unlike `client_message`, this distinguishes the variants: it is only
+    /// ever stored, never returned to the caller, and an auditor needs to tell
+    /// a probe sending garbage apart from one guessing at the secret.
+    pub fn audit_reason(&self) -> &'static str {
+        match self {
+            SignatureError::SecretNotConfigured => "secret_not_configured",
+            SignatureError::MissingSignature => "missing_signature",
+            SignatureError::MalformedSignature => "malformed_signature",
+            SignatureError::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Upper bound on a rejected body we are willing to persist.
+///
+/// The body of a rejected request is unauthenticated attacker-controlled
+/// input; storing it unbounded turns this audit table into a way to fill the
+/// disk. Anything larger is recorded as NULL — the reason and timestamp are
+/// what matter for an audit, the payload is a convenience.
+const MAX_LOGGED_REJECTED_BODY: usize = 8 * 1024;
+
+/// Persist a rejected webhook so authentication failures are auditable.
+///
+/// Best-effort by design: a failure to write the audit row is logged but never
+/// changes the response. The caller has already been rejected, and returning a
+/// different status because our own logging failed would leak information
+/// about our internal state.
+async fn log_auth_failure(state: &AppState, err: SignatureError, body: &Bytes) {
+    // Only well-formed, bounded JSON is stored. Garbage stays out of a JSONB
+    // column, and an oversized body is not worth the space.
+    let raw_payload = if body.len() <= MAX_LOGGED_REJECTED_BODY {
+        serde_json::from_slice::<serde_json::Value>(body).ok()
+    } else {
+        None
+    };
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO kyc_webhook_logs (raw_payload, success, auth_failure_reason)
+        VALUES ($1, FALSE, $2)
+        "#,
+    )
+    .bind(&raw_payload)
+    .bind(err.audit_reason())
+    .execute(&state.db_pool)
+    .await;
+
+    if let Err(e) = result {
+        error!(error = %e, "Failed to write KYC webhook auth-failure log");
+    }
 }
 
 /// Verify an inbound webhook against the configured shared secret.
@@ -149,6 +202,12 @@ pub async fn kyc_webhook_handler(
         verify_webhook_signature(state.kyc_webhook_secret.as_deref(), &body, signature)
     {
         warn!(reason = ?err, "KYC webhook rejected");
+
+        // The early return below used to skip the kyc_webhook_logs insert
+        // further down, so rejected requests left no trace in the database —
+        // exactly the attempts an audit most wants to see.
+        log_auth_failure(&state, err, &body).await;
+
         return (
             err.status(),
             Json(WebhookResponse {
@@ -380,5 +439,49 @@ mod tests {
             // Callers must not learn *why* the signature was rejected.
             assert_eq!(err.client_message(), "Invalid webhook signature");
         }
+    }
+
+    #[test]
+    fn audit_reason_distinguishes_every_variant() {
+        // The client message is deliberately coarse; the audit label must not
+        // be, or an auditor cannot tell a probe sending garbage from one
+        // guessing at the secret.
+        let reasons = [
+            SignatureError::SecretNotConfigured.audit_reason(),
+            SignatureError::MissingSignature.audit_reason(),
+            SignatureError::MalformedSignature.audit_reason(),
+            SignatureError::Mismatch.audit_reason(),
+        ];
+
+        let unique: std::collections::HashSet<_> = reasons.iter().collect();
+        assert_eq!(unique.len(), reasons.len(), "audit reasons must be distinct");
+    }
+
+    #[test]
+    fn audit_reasons_are_stable_snake_case_identifiers() {
+        // These land in a database column that queries and dashboards filter
+        // on, so they are an interface, not prose.
+        for reason in [
+            SignatureError::SecretNotConfigured.audit_reason(),
+            SignatureError::MissingSignature.audit_reason(),
+            SignatureError::MalformedSignature.audit_reason(),
+            SignatureError::Mismatch.audit_reason(),
+        ] {
+            assert!(
+                reason
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{reason} should be a snake_case identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn client_message_still_hides_the_variant() {
+        // Adding a precise audit label must not make the response precise too.
+        assert_eq!(
+            SignatureError::MalformedSignature.client_message(),
+            SignatureError::Mismatch.client_message(),
+        );
     }
 }
