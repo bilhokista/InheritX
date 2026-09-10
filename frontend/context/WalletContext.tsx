@@ -1,6 +1,13 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
+import {
+  ACTIVITY_EVENTS,
+  LAST_ACTIVITY_KEY,
+  isStoredSessionExpired,
+  secondsUntilExpiry,
+  sessionPhase,
+} from "@/lib/walletSession";
 import {
   StellarWalletsKit,
   WalletNetwork,
@@ -17,6 +24,13 @@ export interface SignTransactionOptions {
 interface WalletContextType {
   connect: (moduleId: string) => Promise<void>;
   disconnect: () => Promise<void>;
+  /**
+   * Seconds until the session is dropped, or `null` when it is not close
+   * enough to warn about. A consumer renders the countdown modal from this.
+   */
+  sessionSecondsLeft: number | null;
+  /** Resets the idle timer, e.g. from a "Stay connected" button. */
+  extendSession: () => void;
   signTransaction: (
     xdr: string,
     opts?: SignTransactionOptions
@@ -75,6 +89,16 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     const savedAddress = localStorage.getItem("inheritx_wallet_address");
     const savedWalletId = localStorage.getItem("inheritx_wallet_id");
 
+    // An in-memory timer does nothing once the tab is closed: without this
+    // check, reopening the page tomorrow on a shared machine silently
+    // reconnects the previous person's wallet.
+    if (isStoredSessionExpired(localStorage.getItem(LAST_ACTIVITY_KEY), Date.now())) {
+      localStorage.removeItem("inheritx_wallet_address");
+      localStorage.removeItem("inheritx_wallet_id");
+      localStorage.removeItem(LAST_ACTIVITY_KEY);
+      return;
+    }
+
     if (savedAddress && savedWalletId) {
       setAddress(savedAddress);
       setSelectedWalletId(savedWalletId);
@@ -96,6 +120,56 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       window.removeEventListener("stellar-wallet:address-change", handleAddressChange);
     };
   }, []);
+
+  // ── Session expiry ──────────────────────────────────────────────────────
+
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+  // Held in a ref, not state: activity fires constantly and re-rendering the
+  // whole wallet tree on every mousemove would be its own bug.
+  const lastActivityRef = useRef<number>(Date.now());
+
+  const recordActivity = useCallback(() => {
+    const now = Date.now();
+    lastActivityRef.current = now;
+    try {
+      localStorage.setItem(LAST_ACTIVITY_KEY, String(now));
+    } catch {
+      // Private browsing can refuse writes; the in-memory timer still runs.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!address) {
+      setSecondsLeft(null);
+      return;
+    }
+
+    recordActivity();
+    ACTIVITY_EVENTS.forEach((event) =>
+      window.addEventListener(event, recordActivity, { passive: true }),
+    );
+
+    const interval = window.setInterval(() => {
+      const phase = sessionPhase(lastActivityRef.current, Date.now());
+
+      if (phase === "expired") {
+        void disconnectRef.current?.();
+        setSecondsLeft(null);
+        return;
+      }
+
+      setSecondsLeft(
+        phase === "warning" ? secondsUntilExpiry(lastActivityRef.current, Date.now()) : null,
+      );
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+      ACTIVITY_EVENTS.forEach((event) =>
+        window.removeEventListener(event, recordActivity),
+      );
+    };
+  }, [address, recordActivity]);
 
   const supportedWallets = [
     { id: "freighter", name: "Freighter", icon: WALLET_ICONS.freighter },
@@ -146,8 +220,10 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   const disconnect = useCallback(async () => {
     setAddress(null);
     setSelectedWalletId(null);
+    setSecondsLeft(null);
     localStorage.removeItem("inheritx_wallet_address");
     localStorage.removeItem("inheritx_wallet_id");
+    localStorage.removeItem(LAST_ACTIVITY_KEY);
     if (kit) {
       try {
         await kit.disconnect();
@@ -156,6 +232,14 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       }
     }
   }, [kit]);
+
+  // Lets the expiry interval call the latest `disconnect` without listing it
+  // as a dependency, which would tear down and rebuild the timer on every
+  // change to `kit`.
+  const disconnectRef = useRef<typeof disconnect | null>(null);
+  useEffect(() => {
+    disconnectRef.current = disconnect;
+  }, [disconnect]);
 
   const signTransaction = useCallback(
     async (
@@ -192,6 +276,8 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         isModalOpen,
         supportedWallets,
         networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+        sessionSecondsLeft: secondsLeft,
+        extendSession: recordActivity,
       }}
     >
       {children}
