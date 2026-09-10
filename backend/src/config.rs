@@ -6,6 +6,11 @@ use crate::stellar_submit::SorobanConfig;
 pub struct Config {
     pub port: u16,
     pub database_url: String,
+    /// Optional read-only replica. `None` means every query uses the primary.
+    ///
+    /// See [`Config::resolve_read_database_url`] for why a value identical to
+    /// `database_url` is treated as absent.
+    pub read_database_url: Option<String>,
     pub redis_url: Option<String>,
     pub plan_cache_ttl_secs: u64,
     /// TTL for the cached `/api/analytics/plan-statistics` response. Kept
@@ -33,6 +38,10 @@ impl Config {
             .unwrap_or(3001);
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/inheritx".to_string());
+        let read_database_url = Self::resolve_read_database_url(
+            std::env::var("READ_DATABASE_URL").ok().as_deref(),
+            &database_url,
+        );
         let redis_url = std::env::var("REDIS_URL")
             .ok()
             .map(|value| value.trim().to_string())
@@ -70,6 +79,7 @@ impl Config {
         Ok(Config {
             port,
             database_url,
+            read_database_url,
             redis_url,
             plan_cache_ttl_secs,
             plan_statistics_cache_ttl_secs,
@@ -79,5 +89,69 @@ impl Config {
             fiat_daily_limit_default,
             soroban: SorobanConfig::from_env(),
         })
+    }
+}
+
+impl Config {
+    /// Normalises `READ_DATABASE_URL` into an optional replica.
+    ///
+    /// Returns `None` when unset, blank, or identical to the primary. The last
+    /// case matters: a deployment that sets both to the same value is not
+    /// running a replica, and opening a second pool to the same server would
+    /// double the connection count against `max_connections` while making the
+    /// logs claim a replica is in use.
+    pub fn resolve_read_database_url(value: Option<&str>, primary: &str) -> Option<String> {
+        let candidate = value?.trim();
+
+        if candidate.is_empty() || candidate == primary.trim() {
+            None
+        } else {
+            Some(candidate.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_replica_tests {
+    use super::*;
+
+    const PRIMARY: &str = "postgres://user:pass@primary:5432/inheritx";
+    const REPLICA: &str = "postgres://user:pass@replica:5432/inheritx";
+
+    #[test]
+    fn a_distinct_replica_is_used() {
+        assert_eq!(
+            Config::resolve_read_database_url(Some(REPLICA), PRIMARY),
+            Some(REPLICA.to_string())
+        );
+    }
+
+    #[test]
+    fn an_unset_or_blank_value_means_no_replica() {
+        assert_eq!(Config::resolve_read_database_url(None, PRIMARY), None);
+        assert_eq!(Config::resolve_read_database_url(Some(""), PRIMARY), None);
+        assert_eq!(Config::resolve_read_database_url(Some("   "), PRIMARY), None);
+    }
+
+    #[test]
+    fn a_replica_identical_to_the_primary_is_not_a_replica() {
+        // Otherwise a second pool doubles the connection count against the
+        // same server while the logs claim a replica is in use.
+        assert_eq!(Config::resolve_read_database_url(Some(PRIMARY), PRIMARY), None);
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_create_a_phantom_replica() {
+        let padded = format!("  {PRIMARY}  ");
+        assert_eq!(Config::resolve_read_database_url(Some(&padded), PRIMARY), None);
+    }
+
+    #[test]
+    fn a_replica_url_is_trimmed() {
+        let padded = format!("  {REPLICA}  ");
+        assert_eq!(
+            Config::resolve_read_database_url(Some(&padded), PRIMARY),
+            Some(REPLICA.to_string())
+        );
     }
 }
