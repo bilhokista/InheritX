@@ -145,6 +145,35 @@ impl DbManager {
         }))
     }
 
+    /// Pool for read-only queries.
+    ///
+    /// Falls back to a clone of `primary` when no replica is configured, or
+    /// when connecting to the replica fails. A replica being unreachable is a
+    /// throughput problem, not a correctness one — refusing to start would
+    /// turn a degraded read path into a total outage, so it is logged loudly
+    /// and the primary carries the load.
+    ///
+    /// Callers therefore never branch: they always have a usable pool.
+    pub async fn create_read_pool(primary: &PgPool, read_database_url: Option<&str>) -> PgPool {
+        let Some(url) = read_database_url else {
+            return primary.clone();
+        };
+
+        match Self::create_pool(url).await {
+            Ok(pool) => {
+                tracing::info!("Read replica pool connected; analytics reads will use it");
+                pool
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Read replica unavailable, falling back to the primary for reads"
+                );
+                primary.clone()
+            }
+        }
+    }
+
     /// Runs database migrations
     pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
         let _ = sqlx::query(
