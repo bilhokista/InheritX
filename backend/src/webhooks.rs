@@ -26,7 +26,13 @@ impl WebhookDispatcherService {
         }
     }
 
-    pub fn start(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+    /// Returns the task handle so shutdown can wait for the loop to finish
+    /// its current iteration rather than yanking the database out from
+    /// under it.
+    pub fn start(
+        self: Arc<Self>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -42,7 +48,7 @@ impl WebhookDispatcherService {
                     error!("Webhook dispatcher run failed: {e}");
                 }
             }
-        });
+        })
     }
 
     async fn run_once(&self) -> Result<(), sqlx::Error> {
