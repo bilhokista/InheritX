@@ -11,6 +11,15 @@ import {
 } from "@/app/lib/validation/inheritancePlan";
 import { useWallet } from "@/context/WalletContext";
 import {
+  INACTIVITY_PRESETS,
+  MAX_INACTIVITY_DAYS,
+  MIN_INACTIVITY_DAYS,
+  clampInactivityDays,
+  daysToSeconds,
+  describeExpiry,
+  parseInactivityDays,
+} from "@/lib/gracePeriod";
+import {
   invokeCreateInheritancePlan,
   ContractSimulationError,
   TransactionSubmissionError,
@@ -56,6 +65,9 @@ export function CreateInheritancePlanPanel() {
   const [description, setDescription] = useState("");
   const [depositAmount, setDepositAmount] = useState("");
   const [inactivityDays, setInactivityDays] = useState(180);
+  // Kept as text so the field can be empty mid-edit without the value
+  // snapping to the minimum under the user's cursor.
+  const [inactivityInput, setInactivityInput] = useState("180");
   const [tokenType, setTokenType] = useState<(typeof TOKEN_OPTIONS)[number]>("XLM");
   const [customTokenAddress, setCustomTokenAddress] = useState("");
   const [distributionMethod, setDistributionMethod] = useState<DistributionMethod>("LumpSum");
@@ -202,7 +214,7 @@ export function CreateInheritancePlanPanel() {
           amount: parsedDeposit,
           beneficiaries: beneficiaries.map(beneficiaryDraftToRequest),
           last_ping: Math.floor(Date.now() / 1000),
-          grace_period: inactivityDays * 86400,
+          grace_period: daysToSeconds(inactivityDays),
           earn_yield: false,
           yield_rate_bps: 0,
           is_active: true,
@@ -360,17 +372,52 @@ export function CreateInheritancePlanPanel() {
                 <input
                   id="inactivity-days"
                   type="number"
-                  min={1}
-                  max={3650}
-                  value={inactivityDays}
-                  onChange={(e) => setInactivityDays(Number(e.target.value))}
+                  min={MIN_INACTIVITY_DAYS}
+                  max={MAX_INACTIVITY_DAYS}
+                  value={inactivityInput}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setInactivityInput(raw);
+                    // `min`/`max` restrict the spinner, not typing or pasting,
+                    // so the committed value is clamped here instead.
+                    const parsed = parseInactivityDays(raw);
+                    if (parsed !== null) setInactivityDays(parsed);
+                  }}
+                  onBlur={() => {
+                    // On leaving the field, show what will actually be used.
+                    const settled = clampInactivityDays(inactivityDays);
+                    setInactivityDays(settled);
+                    setInactivityInput(String(settled));
+                  }}
                   className="bg-[#0A0F11] border border-[#2A3338] rounded-lg px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-[#33C5E0] transition-colors w-full sm:w-40"
                 />
               </div>
-              <p className="text-xs text-[#92A5A8] pb-1">
-                Inheritance triggers after {inactivityDays} days of wallet inactivity.
-              </p>
+
+              <div className="flex flex-wrap gap-2 pb-1">
+                {INACTIVITY_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    aria-pressed={inactivityDays === preset}
+                    onClick={() => {
+                      setInactivityDays(preset);
+                      setInactivityInput(String(preset));
+                    }}
+                    className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+                      inactivityDays === preset
+                        ? "border-[#33C5E0] text-[#33C5E0] bg-[#33C5E014]"
+                        : "border-[#2A3338] text-[#92A5A8] hover:text-white"
+                    }`}
+                  >
+                    {preset}d
+                  </button>
+                ))}
+              </div>
             </div>
+
+            <p className="text-xs text-[#92A5A8]" data-testid="inactivity-preview">
+              {describeExpiry(inactivityDays)}
+            </p>
           </section>
 
           <section className="space-y-3">
