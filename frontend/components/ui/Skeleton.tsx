@@ -7,13 +7,23 @@ import React from "react";
 
 interface SkeletonProps {
   className?: string;
+  style?: React.CSSProperties;
+  /**
+   * Hide this element from assistive technology. Use when several skeletons sit
+   * inside one container that already announces the loading state, so a screen
+   * reader hears it once instead of once per placeholder.
+   */
+  decorative?: boolean;
 }
 
-export function Skeleton({ className = "" }: SkeletonProps) {
+export function Skeleton({ className = "", style, decorative = false }: SkeletonProps) {
   return (
     <div
       className={`animate-pulse bg-[#1C252A] rounded ${className}`}
-      aria-label="Loading..."
+      style={style}
+      {...(decorative
+        ? { "aria-hidden": true as const }
+        : { "aria-label": "Loading..." })}
     />
   );
 }
@@ -148,6 +158,32 @@ export function PlansPageSkeleton() {
           <SkeletonCard key={i} />
         ))}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Chart placeholder used while chart data is being fetched.
+ *
+ * `height` must be the same value the chart itself renders at, otherwise the
+ * layout moves when real data arrives — which is the whole point of showing a
+ * placeholder. Callers pass their chart height rather than hardcoding one here.
+ */
+export function SkeletonChart({ height = 240 }: { height?: number }) {
+  // Bar heights are fixed rather than random so the placeholder does not
+  // reshuffle on every re-render while loading.
+  const bars = [45, 70, 55, 85, 60, 95, 75, 100, 80, 65, 90, 70];
+
+  return (
+    <div
+      style={{ height }}
+      className="flex w-full items-end gap-2"
+      role="status"
+      aria-label="Loading chart"
+    >
+      {bars.map((h, i) => (
+        <Skeleton key={i} decorative className="flex-1 rounded-sm" style={{ height: `${h}%` }} />
+      ))}
     </div>
   );
 }
