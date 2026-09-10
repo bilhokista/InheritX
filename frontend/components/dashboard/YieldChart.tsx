@@ -12,11 +12,14 @@ import {
   TooltipProps,
 } from 'recharts';
 import { YieldDataPoint } from '@/app/hooks/useYieldCalculations';
+import { SkeletonChart } from '@/components/ui/Skeleton';
 
 interface YieldChartProps {
   data: YieldDataPoint[];
   title?: string;
   height?: number;
+  /** Render the placeholder instead of the chart while data is in flight. */
+  isLoading?: boolean;
   currency?: string;
 }
 
@@ -81,11 +84,34 @@ export function YieldChart({
   title = 'Projected Yield Over Time',
   height = 300,
   currency = '$',
+  isLoading = false,
 }: YieldChartProps) {
-  if (data.length === 0) {
+  if (isLoading) {
     return (
-      <div className="w-full h-80 flex items-center justify-center rounded-lg border border-white/10 bg-white/[0.03]">
-        <p className="text-sm text-gray-500">No data to display</p>
+      <div className="space-y-3">
+        {title && <h3 className="text-sm font-semibold text-slate-100">{title}</h3>}
+        <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
+          <SkeletonChart height={height} />
+        </div>
+      </div>
+    );
+  }
+
+  if (data.length === 0) {
+    // Sized from `height` rather than a fixed h-80. Previously the empty state
+    // was 320px while the chart rendered at `height` (300px by default), so
+    // going from empty to loaded moved everything below it.
+    return (
+      <div className="space-y-3">
+        {title && <h3 className="text-sm font-semibold text-slate-100">{title}</h3>}
+        <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
+          <div
+            style={{ height }}
+            className="flex w-full items-center justify-center"
+          >
+            <p className="text-sm text-gray-500">No data to display</p>
+          </div>
+        </div>
       </div>
     );
   }
