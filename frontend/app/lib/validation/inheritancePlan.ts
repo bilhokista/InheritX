@@ -82,6 +82,17 @@ export function isValidStellarAccount(address: string): boolean {
   return isValidStrKey(address, ED25519_PUBLIC_KEY_VERSION_BYTE);
 }
 
+/**
+ * Whether `value` is a well-formed Soroban contract id (`C…` strkey).
+ *
+ * Exposes the checksum-verified check already used for custom token
+ * addresses, so callers validating a configured contract id do not grow a
+ * second, looser implementation that accepts ids this one would reject.
+ */
+export function isValidContractId(value: string): boolean {
+  return isValidStrKey(value, CONTRACT_VERSION_BYTE);
+}
+
 export function isValidTokenIdentifier(tokenType: string, customTokenAddress = ""): boolean {
   const token = tokenType.trim().toUpperCase();
   return TOKEN_ALIASES.has(token) || isValidStrKey(customTokenAddress, CONTRACT_VERSION_BYTE);
