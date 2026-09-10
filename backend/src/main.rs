@@ -125,6 +125,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     webhook_dispatcher.start(shutdown_rx.clone());
 
+    // Daily yield ledger. Accrued yield was only ever computed on read, so
+    // there was no record of what a plan was worth on any past day.
+    let yield_snapshots = Arc::new(
+        inheritx_backend::yield_calculator::YieldSnapshotService::new(db_pool.clone()),
+    );
+    yield_snapshots.start(shutdown_rx.clone());
+
     // Periodically refresh DB pool metrics
     #[cfg(feature = "metrics")]
     {
