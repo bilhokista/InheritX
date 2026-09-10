@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useWallet } from "@/context/WalletContext";
 import { plansAPI, type Plan } from "@/app/lib/api/plans";
 import { getPlans } from "@/lib/api/dataSource";
@@ -153,11 +154,33 @@ function PlanCard({ plan }: { plan: Plan }) {
 const STATUS_FILTERS = ["All", "Active", "Pending", "Triggered", "Completed"];
 
 export default function PlansPage() {
+  return (
+    <Suspense fallback={null}>
+      <PlansPageContent />
+    </Suspense>
+  );
+}
+
+function PlansPageContent() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
   const { isConnected, address, openModal } = useWallet();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("All");
+  // Keadaan awal dibaca dari URL supaya tautan yang dibagikan atau halaman yang
+  // dimuat ulang membuka tampilan yang sama, bukan kembali ke "All".
+  const [search, setSearch] = useState(() => searchParams.get("search") ?? "");
+  const [statusFilter, setStatusFilter] = useState(() => {
+    const dariUrl = searchParams.get("status");
+    if (!dariUrl) return "All";
+    // Cocokkan tanpa peduli huruf besar-kecil supaya ?status=active tetap sah,
+    // lalu kembalikan bentuk kanonik agar tab yang aktif ikut benar.
+    return (
+      STATUS_FILTERS.find((f) => f.toLowerCase() === dariUrl.toLowerCase()) ?? "All"
+    );
+  });
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -178,11 +201,51 @@ export default function PlansPage() {
 
   const handleRefresh = () => { setRefreshing(true); fetchPlans(); };
 
-  const filtered = plans.filter((p) => {
-    const matchStatus = statusFilter === "All" || p.status?.toUpperCase() === statusFilter.toUpperCase();
-    const matchSearch = !search || p.id?.toLowerCase().includes(search.toLowerCase()) || p.token_address?.toLowerCase().includes(search.toLowerCase());
-    return matchStatus && matchSearch;
-  });
+  // Tulis filter ke URL. `replace`, bukan `push`: mengetik satu kata pencarian
+  // akan membuat satu entri riwayat per huruf dan membuat tombol Back tidak
+  // bisa dipakai keluar dari halaman.
+  //
+  // Penundaan singkat hanya berlaku untuk penulisan URL; kotak isian tetap
+  // responsif karena `search` diperbarui seketika.
+  const tulisanPertama = useRef(true);
+  useEffect(() => {
+    if (tulisanPertama.current) {
+      // Jangan menulis ulang URL saat render pertama - itu akan menghapus
+      // parameter lain yang mungkin dibawa tautan masuk.
+      tulisanPertama.current = false;
+      return;
+    }
+    const t = setTimeout(() => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (search) params.set("search", search);
+      else params.delete("search");
+      if (statusFilter !== "All") params.set("status", statusFilter.toLowerCase());
+      else params.delete("status");
+      const q = params.toString();
+      router.replace(q ? pathname + "?" + q : pathname, { scroll: false });
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search, statusFilter, pathname, router, searchParams]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return plans.filter((p) => {
+      const matchStatus =
+        statusFilter === "All" || p.status?.toUpperCase() === statusFilter.toUpperCase();
+      if (!q) return matchStatus;
+      const matchSearch =
+        p.id?.toLowerCase().includes(q) ||
+        p.token_address?.toLowerCase().includes(q) ||
+        // Nama rencana: diminta issue #1086 dan sebelumnya tidak ikut dicari.
+        p.title?.toLowerCase().includes(q) ||
+        // Alamat penerima: `beneficiaries` bertipe any[], jadi aksesnya dijaga
+        // agar rencana tanpa penerima tidak melempar error.
+        (p.beneficiaries ?? []).some((b: any) =>
+          b?.wallet_address?.toLowerCase().includes(q)
+        );
+      return matchStatus && matchSearch;
+    });
+  }, [plans, search, statusFilter]);
 
   return (
     <div className="animate-fade-in space-y-6 max-w-5xl">
