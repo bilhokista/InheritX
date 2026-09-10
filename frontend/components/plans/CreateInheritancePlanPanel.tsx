@@ -1,8 +1,16 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { AlertCircle, CheckCircle, ExternalLink, Loader2, Plus } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle,
+  Download,
+  ExternalLink,
+  Loader2,
+  Plus,
+  Upload,
+} from "lucide-react";
 import { plansAPI } from "@/app/lib/api/plans";
 import type { CreatePlanRequest } from "@/app/lib/api/plans";
 import {
@@ -10,6 +18,12 @@ import {
   isValidTokenIdentifier,
 } from "@/app/lib/validation/inheritancePlan";
 import { useWallet } from "@/context/WalletContext";
+import {
+  BENEFICIARY_CSV_TEMPLATE,
+  describeAllocationTotal,
+  parseBeneficiaryCsv,
+  type CsvRowError,
+} from "@/lib/beneficiaryCsv";
 import {
   invokeCreateInheritancePlan,
   ContractSimulationError,
@@ -72,6 +86,54 @@ export function CreateInheritancePlanPanel() {
   const [explorerUrl, setExplorerUrl] = useState<string | null>(null);
 
   const allocationTotalBps = totalAllocationBps(beneficiaries);
+
+  const csvInputRef = useRef<HTMLInputElement>(null);
+  const [csvErrors, setCsvErrors] = useState<CsvRowError[]>([]);
+  const [csvNotice, setCsvNotice] = useState<string | null>(null);
+
+  const downloadCsvTemplate = useCallback(() => {
+    const url = URL.createObjectURL(
+      new Blob([BENEFICIARY_CSV_TEMPLATE], { type: "text/csv;charset=utf-8" }),
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "beneficiaries-template.csv";
+    link.click();
+    // Without this the blob is held for the lifetime of the document.
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const handleCsvFile = useCallback(async (file: File) => {
+    const { rows, errors } = parseBeneficiaryCsv(await file.text());
+    setCsvErrors(errors);
+
+    if (rows.length === 0) {
+      setCsvNotice(null);
+      return;
+    }
+
+    // Replaces rather than appends: a CSV describes a whole allocation, and
+    // merging it with existing rows would silently push the total past 100%.
+    setBeneficiaries(
+      rows.map((row) => ({
+        ...DEFAULT_BENEFICIARY_DRAFT,
+        name: row.name,
+        address: row.address,
+        email: row.email,
+        allocationBps: row.allocationBps,
+        claimCode: generateClaimCode(),
+      })),
+    );
+
+    // Structural parsing is done; the existing validators still decide whether
+    // the addresses, emails and total are acceptable.
+    const totalNote = describeAllocationTotal(rows);
+    setCsvNotice(
+      totalNote
+        ? `Imported ${rows.length} beneficiaries. ${totalNote}`
+        : `Imported ${rows.length} beneficiaries.`,
+    );
+  }, []);
   const { rowErrors, totalError } = useMemo(() => {
     const base = validateBeneficiaryDrafts(beneficiaries);
     const onChain = validateContractBeneficiaryDrafts(beneficiaries);
@@ -334,14 +396,64 @@ export function CreateInheritancePlanPanel() {
               </AnimatePresence>
             </div>
 
-            <button
-              type="button"
-              onClick={addBeneficiary}
-              className="flex items-center gap-2 text-sm text-[#33C5E0] hover:text-cyan-300 transition-colors"
-            >
-              <Plus size={15} />
-              Add beneficiary
-            </button>
+            <div className="flex flex-wrap items-center gap-4">
+              <button
+                type="button"
+                onClick={addBeneficiary}
+                className="flex items-center gap-2 text-sm text-[#33C5E0] hover:text-cyan-300 transition-colors"
+              >
+                <Plus size={15} />
+                Add beneficiary
+              </button>
+
+              <button
+                type="button"
+                onClick={() => csvInputRef.current?.click()}
+                className="flex items-center gap-2 text-sm text-[#33C5E0] hover:text-cyan-300 transition-colors"
+              >
+                <Upload size={15} />
+                Import beneficiaries CSV
+              </button>
+
+              <button
+                type="button"
+                onClick={downloadCsvTemplate}
+                className="flex items-center gap-2 text-sm text-[#8899A6] hover:text-white transition-colors"
+              >
+                <Download size={15} />
+                Download template
+              </button>
+
+              <input
+                ref={csvInputRef}
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                aria-label="Import beneficiaries from a CSV file"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void handleCsvFile(file);
+                  // Reset so re-selecting the same file fires change again.
+                  event.target.value = "";
+                }}
+              />
+            </div>
+
+            {csvNotice && (
+              <p className="text-xs text-[#8899A6]" role="status">
+                {csvNotice}
+              </p>
+            )}
+
+            {csvErrors.length > 0 && (
+              <ul className="space-y-1 text-xs text-[#F56565]" role="alert">
+                {csvErrors.map((error) => (
+                  <li key={`${error.line}-${error.message}`}>
+                    Line {error.line}: {error.message}
+                  </li>
+                ))}
+              </ul>
+            )}
 
             {showErrors && totalError && (
               <p className="text-xs text-[#F56565]">{totalError}</p>
