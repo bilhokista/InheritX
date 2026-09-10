@@ -88,6 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // Never fails: falls back to the primary when no replica is configured or
+    // the replica is unreachable.
+    let read_db_pool =
+        DbManager::create_read_pool(&db_pool, config.read_database_url.as_deref()).await;
+
     let (kyc_tx, _) = tokio::sync::broadcast::channel(100);
     let (status_tx, _) = tokio::sync::broadcast::channel(100);
     // Initialize state
@@ -96,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.anchor_api_url.clone(),
         )),
         db_pool: db_pool.clone(),
+        read_db_pool: read_db_pool.clone(),
         kyc_webhook_secret: config.kyc_webhook_secret.clone(),
         apy_config: inheritx_backend::yield_calculator::ApyConfig::from_env(),
         plan_cache: plan_cache.clone(),
@@ -162,7 +168,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Signal all background tasks to stop
     drop(shutdown_tx);
 
-    // Close database connections
+    // Close database connections. The read pool is a distinct pool only when a
+    // replica is configured; closing a clone of the primary twice is a no-op.
+    read_db_pool.close().await;
     db_pool.close().await;
     info!("Database connections closed. Goodbye.");
 
