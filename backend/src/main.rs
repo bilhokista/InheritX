@@ -6,7 +6,9 @@ use inheritx_backend::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -118,19 +120,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_stellar(stellar_submit),
     );
-    inactivity_watchdog.start(shutdown_rx.clone());
+    // Handles are kept so shutdown can wait for each loop to finish its
+    // current iteration instead of closing the pool underneath it.
+    let mut background_tasks: Vec<JoinHandle<()>> =
+        vec![inactivity_watchdog.start(shutdown_rx.clone())];
 
     let webhook_dispatcher = Arc::new(inheritx_backend::WebhookDispatcherService::new(
         db_pool.clone(),
     ));
-    webhook_dispatcher.start(shutdown_rx.clone());
+    background_tasks.push(webhook_dispatcher.start(shutdown_rx.clone()));
 
     // Periodically refresh DB pool metrics
     #[cfg(feature = "metrics")]
     {
         let pool = db_pool.clone();
         let mut rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        background_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 tokio::select! {
@@ -143,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-        });
+        }));
     }
 
     // Create Axum application
@@ -159,14 +164,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Signal all background tasks to stop
-    drop(shutdown_tx);
+    // Signal all background tasks to stop.
+    //
+    // Sent explicitly rather than relying on `drop(shutdown_tx)`: dropping the
+    // sender happens to wake the receivers, but it says nothing about intent
+    // and would stop working the moment any task held a sender clone.
+    // `send` cannot fail here: main still holds `shutdown_rx`, so the channel
+    // always has at least one receiver.
+    let _ = shutdown_tx.send(true);
+
+    // Wait for them before closing the pool. Previously the pool was closed
+    // immediately after signalling, so a task in the middle of a transaction
+    // could have its connection pulled out from under it.
+    await_background_tasks(background_tasks, SHUTDOWN_GRACE).await;
 
     // Close database connections
     db_pool.close().await;
     info!("Database connections closed. Goodbye.");
 
     Ok(())
+}
+
+/// How long background tasks get to finish after being asked to stop.
+///
+/// Bounded on purpose: an orchestrator sends SIGKILL after its own timeout
+/// (30s by default for Kubernetes and Docker), so waiting indefinitely just
+/// converts a clean exit into a killed one. Fifteen seconds leaves room for an
+/// in-flight transaction and still lands well inside that budget.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
+/// Waits for every background task, giving up after `grace`.
+///
+/// Returns whether all of them stopped in time, which the caller logs — a
+/// timeout means something was still working when the pool closed, and that is
+/// worth seeing in the logs of a deploy that later shows odd data.
+async fn await_background_tasks(tasks: Vec<JoinHandle<()>>, grace: Duration) -> bool {
+    if tasks.is_empty() {
+        return true;
+    }
+
+    let total = tasks.len();
+    let joined = tokio::time::timeout(grace, async {
+        for task in tasks {
+            // A panicking task must not stop us waiting for the rest, and it
+            // has already been reported by the panic hook.
+            if let Err(e) = task.await {
+                warn!("Background task ended abnormally: {e}");
+            }
+        }
+    })
+    .await;
+
+    match joined {
+        Ok(()) => {
+            info!("All {total} background tasks stopped cleanly");
+            true
+        }
+        Err(_) => {
+            warn!(
+                "Timed out after {}s waiting for background tasks; closing the pool anyway",
+                grace.as_secs()
+            );
+            false
+        }
+    }
 }
 
 /// Waits for SIGTERM (Unix) or CTRL+C (Windows/Unix) to initiate graceful shutdown.
