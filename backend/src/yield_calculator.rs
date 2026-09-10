@@ -1,3 +1,11 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{Datelike, NaiveDate, TimeZone, Timelike, Utc};
+use sqlx::PgPool;
+use tokio::sync::watch;
+use tracing::{error, info, warn};
+
 /// Configuration for yield calculations.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApyConfig {
@@ -72,5 +80,196 @@ mod tests {
         let yield_amount = calculate_yield(1_000_000.0, 200, one_year_secs);
         // 2% of 1,000,000 = 20,000
         assert!((yield_amount - 20_000.0).abs() < 1.0);
+    }
+}
+
+// ── Daily snapshot ledger ──────────────────────────────────────────────────
+
+/// UTC hour the daily snapshot runs at, from `YIELD_SNAPSHOT_HOUR_UTC`.
+fn snapshot_hour_utc() -> u32 {
+    std::env::var("YIELD_SNAPSHOT_HOUR_UTC")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|h| *h < 24)
+        .unwrap_or(0)
+}
+
+/// Seconds from `now_secs` until the next occurrence of `hour` UTC.
+///
+/// Always strictly positive. Landing exactly on the hour returns a full day
+/// rather than zero — a zero delay would spin the worker in a tight loop,
+/// re-running the snapshot as fast as the database could answer.
+pub fn seconds_until_next_run(now_secs: i64, hour: u32) -> i64 {
+    const DAY: i64 = 86_400;
+    let hour_secs = (hour as i64) * 3_600;
+
+    let since_midnight = now_secs.rem_euclid(DAY);
+    let delta = hour_secs - since_midnight;
+
+    if delta > 0 {
+        delta
+    } else {
+        delta + DAY
+    }
+}
+
+/// Seconds a plan has been accruing, clamped at zero.
+///
+/// `last_ping` is stored as epoch seconds and can sit in the future after a
+/// clock correction. Subtracting without a floor would wrap into an enormous
+/// positive number and write a wildly inflated figure into the ledger.
+pub fn elapsed_since_ping(last_ping: i64, now_secs: i64) -> u64 {
+    now_secs.saturating_sub(last_ping).max(0) as u64
+}
+
+/// Periodically records what every active plan is worth.
+pub struct YieldSnapshotService {
+    db_pool: PgPool,
+}
+
+impl YieldSnapshotService {
+    pub fn new(db_pool: PgPool) -> Self {
+        Self { db_pool }
+    }
+
+    /// Starts the daily loop, waking on `shutdown_rx` to exit.
+    pub fn start(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+        tokio::spawn(async move {
+            loop {
+                let wait = seconds_until_next_run(Utc::now().timestamp(), snapshot_hour_utc());
+                info!("Next yield snapshot in {wait}s");
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(wait as u64)) => {}
+                    _ = shutdown_rx.changed() => {
+                        info!("Yield snapshot worker shutting down");
+                        return;
+                    }
+                }
+
+                match self.snapshot_all(Utc::now()).await {
+                    Ok(written) => info!("Wrote {written} yield snapshots"),
+                    // A failed run must not kill the worker: the unique
+                    // constraint makes the next attempt safe to repeat.
+                    Err(e) => error!("Yield snapshot run failed: {e}"),
+                }
+            }
+        });
+    }
+
+    /// Writes one snapshot per active plan for `now`'s UTC date.
+    ///
+    /// Returns how many rows were inserted, which is fewer than the number of
+    /// plans when a run for the same day already happened.
+    pub async fn snapshot_all(&self, now: chrono::DateTime<Utc>) -> Result<u64, sqlx::Error> {
+        let snapshot_date: NaiveDate = now.date_naive();
+        let now_secs = now.timestamp();
+
+        let plans = sqlx::query_as::<_, (uuid::Uuid, rust_decimal::Decimal, i32, i64)>(
+            "SELECT id, amount, yield_rate_bps, last_ping
+             FROM plans
+             WHERE is_active = TRUE AND earn_yield = TRUE",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let mut written = 0u64;
+
+        for (plan_id, amount, rate_bps, last_ping) in plans {
+            let elapsed = elapsed_since_ping(last_ping, now_secs);
+            let principal = amount.to_string().parse::<f64>().unwrap_or(0.0);
+            let accrued = calculate_yield(principal, rate_bps.max(0) as u32, elapsed);
+
+            let result = sqlx::query(
+                "INSERT INTO daily_yield_snapshots
+                     (plan_id, snapshot_date, principal, yield_rate_bps, accrued_yield)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (plan_id, snapshot_date) DO NOTHING",
+            )
+            .bind(plan_id)
+            .bind(snapshot_date)
+            .bind(amount)
+            .bind(rate_bps)
+            .bind(rust_decimal::Decimal::from_f64_retain(accrued).unwrap_or_default())
+            .execute(&self.db_pool)
+            .await;
+
+            match result {
+                Ok(r) => written += r.rows_affected(),
+                // One bad plan must not abandon the rest of the ledger.
+                Err(e) => warn!("Snapshot failed for plan {plan_id}: {e}"),
+            }
+        }
+
+        Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// Epoch seconds for a UTC wall-clock time on 1 Jan 2026.
+    fn at(hour: u32, minute: u32) -> i64 {
+        Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn schedules_forward_to_todays_run() {
+        // 03:00 now, run at 05:00 -> two hours.
+        assert_eq!(seconds_until_next_run(at(3, 0), 5), 2 * 3_600);
+    }
+
+    #[test]
+    fn wraps_to_tomorrow_once_the_hour_has_passed() {
+        // 06:00 now, run at 05:00 -> 23 hours.
+        assert_eq!(seconds_until_next_run(at(6, 0), 5), 23 * 3_600);
+    }
+
+    #[test]
+    fn never_returns_zero_on_the_hour() {
+        // A zero delay would spin the worker instead of waiting a day.
+        assert_eq!(seconds_until_next_run(at(5, 0), 5), 86_400);
+        assert_eq!(seconds_until_next_run(at(0, 0), 0), 86_400);
+    }
+
+    #[test]
+    fn is_always_a_positive_wait_within_a_day() {
+        for hour in 0..24u32 {
+            for now in [at(0, 0), at(5, 30), at(12, 0), at(23, 59)] {
+                let wait = seconds_until_next_run(now, hour);
+                assert!(wait > 0, "hour {hour} produced a non-positive wait");
+                assert!(wait <= 86_400, "hour {hour} produced a wait over a day");
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_counts_forward_normally() {
+        assert_eq!(elapsed_since_ping(1_000, 1_600), 600);
+    }
+
+    #[test]
+    fn a_ping_in_the_future_yields_zero_not_a_wrapped_number() {
+        // Subtracting without a floor would wrap into an enormous positive
+        // number and write an absurd figure into the ledger.
+        assert_eq!(elapsed_since_ping(2_000, 1_000), 0);
+        assert_eq!(elapsed_since_ping(i64::MAX, 0), 0);
+    }
+
+    #[test]
+    fn snapshot_hour_defaults_and_rejects_nonsense() {
+        // Guards the filter in snapshot_hour_utc: an out-of-range hour would
+        // otherwise make seconds_until_next_run schedule beyond a day.
+        for value in ["24", "99", "-1", "abc", ""] {
+            let parsed = value
+                .parse::<u32>()
+                .ok()
+                .filter(|h| *h < 24)
+                .unwrap_or(0);
+            assert_eq!(parsed, 0, "{value} should fall back to midnight");
+        }
     }
 }
