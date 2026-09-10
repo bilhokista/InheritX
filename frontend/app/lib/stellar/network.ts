@@ -7,6 +7,15 @@ import { Networks } from "@stellar/stellar-sdk";
 export const SOROBAN_RPC_URL =
   process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
 
+/**
+ * Additional Soroban RPC endpoints to fall back to, comma-separated.
+ *
+ * Empty by default: which providers this app is willing to send traffic to is
+ * an operator's decision, so no third-party node is hardcoded here. When set,
+ * the error boundary can offer a one-click switch to the next one.
+ */
+export const SOROBAN_RPC_URLS = process.env.NEXT_PUBLIC_SOROBAN_RPC_URLS;
+
 /** Network passphrase the built transaction is signed against. */
 export const STELLAR_NETWORK_PASSPHRASE =
   process.env.NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE ?? Networks.TESTNET;
