@@ -27,6 +27,7 @@ use crate::auth::{
     jwt_auth_middleware, jwt_or_signature_auth_middleware, signature_auth_middleware, Claims,
 };
 use crate::cache::PlanCache;
+use crate::telemetry::request_id_middleware;
 use crate::kyc_webhook::kyc_webhook_handler;
 #[cfg(feature = "metrics")]
 use crate::metrics::{latency_middleware, metrics_handler};
@@ -366,7 +367,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .layer(hsts_layer())
         .layer(axum::middleware::from_fn(move |req, next| {
             geo_restriction_middleware(req, next, geo_guard_config.clone(), geo_resolver.clone())
-        }));
+        }))
+        // Outermost of the layers above, so a request rejected by rate
+        // limiting or the geo guard is still logged under a correlation id —
+        // those are exactly the requests worth tracing.
+        .layer(from_fn(request_id_middleware));
 
     #[cfg(feature = "metrics")]
     let router = router
